@@ -7396,6 +7396,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "editor",
+ "file_icons",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "worktree",
+ "zed_actions",
+]
+
+[[package]]
 name = "grid"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -21254,6 +21278,7 @@ dependencies = [
  "go_to_line",
  "gpui",
  "gpui_tokio",
+ "graph_view",
  "http_client",
  "image_viewer",
  "inspector_ui",
