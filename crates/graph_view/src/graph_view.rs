@@ -443,17 +443,73 @@ impl GraphView {
         // Group nodes by directory
         let mut dir_to_nodes: HashMap<PathBuf, Vec<usize>> = HashMap::default();
         
-        // Arrange nodes in a circle initially with padding
-        let padding = 100.0;
-        let radius = 200.0 + (node_count as f32 * 10.0);
-        let angle_step = std::f32::consts::TAU / node_count as f32;
+        // Collect all directories and sort by depth (shallowest first)
+        let mut all_dirs: Vec<PathBuf> = filtered_nodes.iter()
+            .map(|(path, _)| path.parent().unwrap_or(path.as_path()).to_path_buf())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        all_dirs.sort_by_key(|p| p.components().count());
         
-        for (i, (path, file_node)) in filtered_nodes.iter().enumerate() {
-            let angle = i as f32 * angle_step;
-            let x = padding + 400.0 + radius * angle.cos();
-            let y = padding + 300.0 + radius * angle.sin();
+        // Assign positions to directories hierarchically
+        let mut dir_positions: HashMap<PathBuf, Point<f32>> = HashMap::default();
+        let base_x = 500.0;
+        let base_y = 400.0;
+        let base_radius = 300.0;
+        
+        // Position root-level directories in a circle
+        let root_dirs: Vec<_> = all_dirs.iter()
+            .filter(|dir| {
+                !all_dirs.iter().any(|other| {
+                    other != *dir && dir.starts_with(other)
+                })
+            })
+            .collect();
+        
+        for (i, dir) in root_dirs.iter().enumerate() {
+            let angle = (i as f32 / root_dirs.len().max(1) as f32) * std::f32::consts::TAU;
+            let x = base_x + base_radius * angle.cos();
+            let y = base_y + base_radius * angle.sin();
+            dir_positions.insert((*dir).clone(), Point { x, y });
+        }
+        
+        // Position child directories relative to their parents
+        for dir in &all_dirs {
+            if dir_positions.contains_key(dir) {
+                continue;
+            }
             
+            // Find parent directory
+            if let Some(parent_pos) = all_dirs.iter()
+                .filter(|other| *other != dir && dir.starts_with(other))
+                .max_by_key(|p| p.components().count())
+                .and_then(|parent| dir_positions.get(parent))
+            {
+                // Position child near parent with some offset
+                let offset_angle = (dir.to_string_lossy().len() as f32 * 0.5) % std::f32::consts::TAU;
+                let offset_dist = 80.0;
+                dir_positions.insert(dir.clone(), Point {
+                    x: parent_pos.x + offset_dist * offset_angle.cos(),
+                    y: parent_pos.y + offset_dist * offset_angle.sin(),
+                });
+            } else {
+                // Fallback position
+                dir_positions.insert(dir.clone(), Point { x: base_x, y: base_y });
+            }
+        }
+        
+        // Create nodes positioned around their directory centers
+        for (i, (path, file_node)) in filtered_nodes.iter().enumerate() {
             let directory = path.parent().unwrap_or(path.as_path()).to_path_buf();
+            let dir_center = dir_positions.get(&directory).cloned().unwrap_or(Point { x: base_x, y: base_y });
+            
+            // Get index within this directory for positioning
+            let dir_node_count = dir_to_nodes.entry(directory.clone()).or_insert_with(Vec::new).len();
+            let angle = (dir_node_count as f32 * 0.8) + (i as f32 * 0.3);
+            let node_radius = 60.0 + (dir_node_count as f32 * 15.0);
+            
+            let x = dir_center.x + node_radius * angle.cos();
+            let y = dir_center.y + node_radius * angle.sin();
             
             self.layout.nodes.push(NodeLayout {
                 path: (*path).clone(),
@@ -464,7 +520,7 @@ impl GraphView {
                 worktree_id: Some(file_node.worktree_id),
             });
             
-            dir_to_nodes.entry(directory).or_insert_with(Vec::new).push(i);
+            dir_to_nodes.get_mut(&directory).unwrap().push(self.layout.nodes.len() - 1);
         }
         
         // Create directory groups
@@ -480,7 +536,7 @@ impl GraphView {
         }
         
         // Run initial iterations to stabilize
-        for _ in 0..50 {
+        for _ in 0..100 {
             self.update_forces();
         }
         
@@ -540,14 +596,13 @@ impl GraphView {
         let repulsion_strength = 50000.0;
         let edge_attraction_strength = 0.01;
         let directory_attraction_strength = 0.03;
-        let lasso_repulsion_strength = 0.02;  // Gentle push to separate overlapping lassos
-        let lasso_padding = 60.0;
+        let hierarchy_attraction_strength = 0.05;  // Attraction of child dirs to parent dirs
+        let containment_strength = 0.1;  // Force to keep children inside parents
         let damping = 0.85;
         
         // Update directory centroids and calculate radii
         let mut dir_radii: HashMap<PathBuf, f32> = HashMap::default();
-        
-        for (dir_path, dir_group) in self.layout.directories.iter_mut() {
+        for dir_group in self.layout.directories.values_mut() {
             let mut centroid = Point { x: 0.0, y: 0.0 };
             for &idx in &dir_group.node_indices {
                 if idx < self.layout.nodes.len() {
@@ -572,60 +627,19 @@ impl GraphView {
                     max_dist = max_dist.max(dist);
                 }
             }
-            dir_radii.insert(dir_path.clone(), max_dist + lasso_padding);
+            dir_radii.insert(dir_group.path.clone(), max_dist + 70.0);
         }
         
-        // Calculate lasso repulsion forces between directories
-        let dir_keys: Vec<PathBuf> = self.layout.directories.keys().cloned().collect();
-        let mut lasso_forces: HashMap<PathBuf, Point<f32>> = HashMap::default();
-        
-        for i in 0..dir_keys.len() {
-            for j in (i + 1)..dir_keys.len() {
-                let dir_a = &dir_keys[i];
-                let dir_b = &dir_keys[j];
-                
-                let group_a = self.layout.directories.get(dir_a);
-                let group_b = self.layout.directories.get(dir_b);
-                
-                if let (Some(group_a), Some(group_b)) = (group_a, group_b) {
-                    // Skip if either has less than 2 nodes (no lasso drawn)
-                    if group_a.node_indices.len() < 2 || group_b.node_indices.len() < 2 {
-                        continue;
-                    }
-                    
-                    // Skip if one directory is parent of another (containment relationship)
-                    if dir_a.starts_with(dir_b) || dir_b.starts_with(dir_a) {
-                        continue;
-                    }
-                    
-                    let radius_a = dir_radii.get(dir_a).copied().unwrap_or(0.0);
-                    let radius_b = dir_radii.get(dir_b).copied().unwrap_or(0.0);
-                    
-                    let dx = group_a.centroid.x - group_b.centroid.x;
-                    let dy = group_a.centroid.y - group_b.centroid.y;
-                    let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-                    
-                    let min_dist = radius_a + radius_b;
-                    
-                    // If lassos are overlapping, push them apart
-                    if dist < min_dist {
-                        let overlap = min_dist - dist;
-                        let force_magnitude = overlap * lasso_repulsion_strength;
-                        
-                        let force_x = (dx / dist) * force_magnitude;
-                        let force_y = (dy / dist) * force_magnitude;
-                        
-                        // Apply force to directory A (push away from B)
-                        let entry_a = lasso_forces.entry(dir_a.clone()).or_insert(Point { x: 0.0, y: 0.0 });
-                        entry_a.x += force_x;
-                        entry_a.y += force_y;
-                        
-                        // Apply opposite force to directory B
-                        let entry_b = lasso_forces.entry(dir_b.clone()).or_insert(Point { x: 0.0, y: 0.0 });
-                        entry_b.x -= force_x;
-                        entry_b.y -= force_y;
-                    }
-                }
+        // Build parent-child relationships
+        let dir_paths: Vec<PathBuf> = self.layout.directories.keys().cloned().collect();
+        let mut child_to_parent: HashMap<PathBuf, PathBuf> = HashMap::default();
+        for child in &dir_paths {
+            // Find the deepest parent directory
+            if let Some(parent) = dir_paths.iter()
+                .filter(|p| *p != child && child.starts_with(p))
+                .max_by_key(|p| p.components().count())
+            {
+                child_to_parent.insert(child.clone(), parent.clone());
             }
         }
         
@@ -647,8 +661,8 @@ impl GraphView {
             }
             
             // Attraction to directory centroid
-            let node_dir = &self.layout.nodes[i].directory;
-            if let Some(dir_group) = self.layout.directories.get(node_dir) {
+            let node_dir = self.layout.nodes[i].directory.clone();
+            if let Some(dir_group) = self.layout.directories.get(&node_dir) {
                 if dir_group.node_indices.len() > 1 {
                     let dx = dir_group.centroid.x - self.layout.nodes[i].position.x;
                     let dy = dir_group.centroid.y - self.layout.nodes[i].position.y;
@@ -658,10 +672,30 @@ impl GraphView {
                 }
             }
             
-            // Apply lasso repulsion force to this node
-            if let Some(lasso_force) = lasso_forces.get(node_dir) {
-                force.x += lasso_force.x;
-                force.y += lasso_force.y;
+            // Hierarchical containment: attract nodes toward parent directory's centroid
+            // and push them back if they're outside parent's bounding area
+            if let Some(parent_dir) = child_to_parent.get(&node_dir) {
+                if let Some(parent_group) = self.layout.directories.get(parent_dir) {
+                    let parent_centroid = parent_group.centroid;
+                    let parent_radius = dir_radii.get(parent_dir).copied().unwrap_or(200.0);
+                    
+                    let node_pos = self.layout.nodes[i].position;
+                    let dx = node_pos.x - parent_centroid.x;
+                    let dy = node_pos.y - parent_centroid.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    
+                    // Attract toward parent centroid
+                    force.x += (parent_centroid.x - node_pos.x) * hierarchy_attraction_strength;
+                    force.y += (parent_centroid.y - node_pos.y) * hierarchy_attraction_strength;
+                    
+                    // If outside parent's radius, push back strongly
+                    let allowed_radius = parent_radius - 80.0;  // Leave margin for child's own nodes
+                    if dist > allowed_radius && dist > 1.0 {
+                        let overshoot = dist - allowed_radius;
+                        force.x -= (dx / dist) * overshoot * containment_strength;
+                        force.y -= (dy / dist) * overshoot * containment_strength;
+                    }
+                }
             }
             
             self.layout.nodes[i].velocity.x = (self.layout.nodes[i].velocity.x + force.x) * damping;
@@ -710,6 +744,52 @@ impl GraphView {
                 }
             }
         }
+    }
+    
+    /// Compute convex hull using Graham scan algorithm
+    fn convex_hull(points: &[Point<f32>]) -> Vec<Point<f32>> {
+        if points.len() < 3 {
+            return points.to_vec();
+        }
+        
+        // Find the point with lowest y (and leftmost if tied)
+        let mut start_idx = 0;
+        for i in 1..points.len() {
+            if points[i].y < points[start_idx].y 
+                || (points[i].y == points[start_idx].y && points[i].x < points[start_idx].x) {
+                start_idx = i;
+            }
+        }
+        
+        let start = points[start_idx];
+        
+        // Sort points by polar angle with respect to start point
+        let mut sorted: Vec<Point<f32>> = points.iter().cloned().collect();
+        sorted.sort_by(|a, b| {
+            let angle_a = (a.y - start.y).atan2(a.x - start.x);
+            let angle_b = (b.y - start.y).atan2(b.x - start.x);
+            angle_a.partial_cmp(&angle_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Graham scan
+        let mut hull: Vec<Point<f32>> = Vec::new();
+        
+        for p in sorted {
+            while hull.len() >= 2 {
+                let a = hull[hull.len() - 2];
+                let b = hull[hull.len() - 1];
+                // Cross product to check if we make a left turn
+                let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+                if cross <= 0.0 {
+                    hull.pop();
+                } else {
+                    break;
+                }
+            }
+            hull.push(p);
+        }
+        
+        hull
     }
     
     fn handle_node_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -1872,13 +1952,13 @@ impl GraphView {
         let canvas_width = (max_x - min_x.min(0.0)).max(1200.0);
         let canvas_height = (max_y - min_y.min(0.0)).max(800.0);
         
-        let edge_color: Hsla = Hsla::from(rgb(0x6b7280));  // Gray color for edges
-        let arrow_color: Hsla = Hsla::from(rgb(0x4b5563));  // Darker gray for arrows
-        let node_fill = theme_colors.element_background;
-        let node_stroke: Hsla = Hsla::from(rgb(0x3b82f6));  // Blue color for nodes
+        let edge_color: Hsla = Hsla::from(rgb(0x5d3d3a));  // Cocoa color for edges
+        let arrow_color: Hsla = Hsla::from(rgb(0x5d3d3a));  // Cocoa color for arrows
+        let node_fill: Hsla = Hsla::from(rgb(0xdd5013));  // Sunset-orange for nodes
+        let node_stroke: Hsla = Hsla::from(rgb(0xdd5013)).opacity(0.8);  // Sunset-orange for node stroke
         let text_color = theme_colors.text;
-        let lasso_color: Hsla = Hsla::from(rgb(0x3b82f6)).opacity(0.1);  // Light blue for directory lassos
-        let lasso_stroke: Hsla = Hsla::from(rgb(0x3b82f6)).opacity(0.3);
+        let lasso_color: Hsla = Hsla::from(rgb(0xbdb7fc)).opacity(0.15);  // Lavender for directory lassos
+        let lasso_stroke: Hsla = Hsla::from(rgb(0xbdb7fc)).opacity(0.5);  // Lavender for lasso stroke
         
         let dragging = self.dragging_node.is_some();
         
@@ -1941,82 +2021,166 @@ impl GraphView {
                         (edges.clone(), nodes_for_canvas.clone(), directories.clone(), edge_color, arrow_color, node_fill, node_stroke, text_color, lasso_color, lasso_stroke)
                     },
                     move |bounds, (edges, nodes, directories, edge_color, arrow_color, node_fill, node_stroke, _text_color, lasso_color, lasso_stroke), window, _cx| {
-                        // Draw directory lassos first
+                        // Draw directory lassos using convex hull with bezier curves
                         for dir_group in directories.values() {
                             if dir_group.node_indices.len() < 2 {
                                 continue;
                             }
                             
-                            // Collect points for this directory
-                            let mut points: Vec<Point<Pixels>> = dir_group.node_indices.iter()
+                            // Collect node positions for this directory
+                            let node_points: Vec<Point<f32>> = dir_group.node_indices.iter()
                                 .filter_map(|&idx| nodes.get(idx))
-                                .map(|node| point(
-                                    bounds.origin.x + px(node.position.x),
-                                    bounds.origin.y + px(node.position.y)
-                                ))
+                                .map(|node| Point { x: node.position.x, y: node.position.y })
                                 .collect();
                             
-                            if points.len() < 2 {
+                            if node_points.len() < 2 {
                                 continue;
                             }
                             
-                            // Compute convex hull (simple approach: find bounding ellipse)
-                            let padding = px(60.0);
                             let centroid = dir_group.centroid;
-                            let centroid_px = point(
-                                bounds.origin.x + px(centroid.x),
-                                bounds.origin.y + px(centroid.y)
-                            );
+                            let padding = 70.0f32;  // Increased padding to contain nodes
                             
-                            // Find max distance from centroid
-                            let max_dist = points.iter()
+                            // Compute convex hull
+                            let hull = GraphView::convex_hull(&node_points);
+                            
+                            if hull.len() < 2 {
+                                continue;
+                            }
+                            
+                            // Expand hull points outward from centroid by padding amount
+                            let expanded_hull: Vec<Point<Pixels>> = hull.iter()
                                 .map(|p| {
-                                    let dx: f32 = (p.x - centroid_px.x).into();
-                                    let dy: f32 = (p.y - centroid_px.y).into();
-                                    (dx * dx + dy * dy).sqrt()
+                                    let dx = p.x - centroid.x;
+                                    let dy = p.y - centroid.y;
+                                    let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+                                    let expand_x = p.x + (dx / dist) * padding;
+                                    let expand_y = p.y + (dy / dist) * padding;
+                                    point(
+                                        bounds.origin.x + px(expand_x),
+                                        bounds.origin.y + px(expand_y)
+                                    )
                                 })
-                                .fold(0.0f32, f32::max);
+                                .collect();
                             
-                            let padding_f: f32 = padding.into();
-                            let radius = px(max_dist + padding_f);
+                            if expanded_hull.len() < 2 {
+                                continue;
+                            }
                             
-                            // Draw lasso as circle
-                            let mut builder = PathBuilder::fill();
-                            let segments = 64;
-                            for i in 0..=segments {
-                                let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-                                let x = centroid_px.x + radius * angle.cos();
-                                let y = centroid_px.y + radius * angle.sin();
-                                let p = point(x, y);
+                            let hull_len = expanded_hull.len();
+                            
+                            if hull_len >= 3 {
+                                // Draw filled lasso with bezier curves
+                                let mut builder = PathBuilder::fill();
                                 
-                                if i == 0 {
-                                    builder.move_to(p);
-                                } else {
-                                    builder.line_to(p);
-                                }
-                            }
-                            
-                            if let Ok(path) = builder.build() {
-                                window.paint_path(path, lasso_color);
-                            }
-                            
-                            // Draw lasso outline
-                            let mut builder = PathBuilder::stroke(px(2.0));
-                            for i in 0..=segments {
-                                let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-                                let x = centroid_px.x + radius * angle.cos();
-                                let y = centroid_px.y + radius * angle.sin();
-                                let p = point(x, y);
+                                // Start at midpoint between last and first point
+                                let first_mid = point(
+                                    (expanded_hull[hull_len - 1].x + expanded_hull[0].x) / 2.0,
+                                    (expanded_hull[hull_len - 1].y + expanded_hull[0].y) / 2.0
+                                );
+                                builder.move_to(first_mid);
                                 
-                                if i == 0 {
-                                    builder.move_to(p);
-                                } else {
-                                    builder.line_to(p);
+                                // Draw bezier curves: each hull point is a control point
+                                // and we draw to the midpoint between consecutive hull points
+                                for i in 0..hull_len {
+                                    let ctrl = expanded_hull[i];
+                                    let next = expanded_hull[(i + 1) % hull_len];
+                                    let mid = point(
+                                        (ctrl.x + next.x) / 2.0,
+                                        (ctrl.y + next.y) / 2.0
+                                    );
+                                    
+                                    // curve_to(to, ctrl) - draws quadratic bezier
+                                    builder.curve_to(mid, ctrl);
                                 }
-                            }
-                            
-                            if let Ok(path) = builder.build() {
-                                window.paint_path(path, lasso_stroke);
+                                
+                                builder.close();
+                                
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, lasso_color);
+                                }
+                                
+                                // Draw lasso outline with bezier curves
+                                let mut builder = PathBuilder::stroke(px(2.0));
+                                
+                                let first_mid = point(
+                                    (expanded_hull[hull_len - 1].x + expanded_hull[0].x) / 2.0,
+                                    (expanded_hull[hull_len - 1].y + expanded_hull[0].y) / 2.0
+                                );
+                                builder.move_to(first_mid);
+                                
+                                for i in 0..hull_len {
+                                    let ctrl = expanded_hull[i];
+                                    let next = expanded_hull[(i + 1) % hull_len];
+                                    let mid = point(
+                                        (ctrl.x + next.x) / 2.0,
+                                        (ctrl.y + next.y) / 2.0
+                                    );
+                                    
+                                    builder.curve_to(mid, ctrl);
+                                }
+                                
+                                builder.close();
+                                
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, lasso_stroke);
+                                }
+                            } else {
+                                // Fallback for 2 or fewer points: draw a circle
+                                let centroid_px = point(
+                                    bounds.origin.x + px(centroid.x),
+                                    bounds.origin.y + px(centroid.y)
+                                );
+                                
+                                // Calculate radius from centroid to furthest node + padding
+                                let max_dist = node_points.iter()
+                                    .map(|p| {
+                                        let dx = p.x - centroid.x;
+                                        let dy = p.y - centroid.y;
+                                        (dx * dx + dy * dy).sqrt()
+                                    })
+                                    .fold(0.0f32, f32::max);
+                                let radius = px(max_dist + padding);
+                                
+                                // Draw filled circle
+                                let mut builder = PathBuilder::fill();
+                                let segments = 32;
+                                for i in 0..=segments {
+                                    let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                                    let x = centroid_px.x + radius * angle.cos();
+                                    let y = centroid_px.y + radius * angle.sin();
+                                    let p = point(x, y);
+                                    
+                                    if i == 0 {
+                                        builder.move_to(p);
+                                    } else {
+                                        builder.line_to(p);
+                                    }
+                                }
+                                builder.close();
+                                
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, lasso_color);
+                                }
+                                
+                                // Draw circle outline
+                                let mut builder = PathBuilder::stroke(px(2.0));
+                                for i in 0..=segments {
+                                    let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                                    let x = centroid_px.x + radius * angle.cos();
+                                    let y = centroid_px.y + radius * angle.sin();
+                                    let p = point(x, y);
+                                    
+                                    if i == 0 {
+                                        builder.move_to(p);
+                                    } else {
+                                        builder.line_to(p);
+                                    }
+                                }
+                                builder.close();
+                                
+                                if let Ok(path) = builder.build() {
+                                    window.paint_path(path, lasso_stroke);
+                                }
                             }
                         }
                         
@@ -2109,11 +2273,12 @@ impl GraphView {
                             );
                             let radius = px(25.0);
                             
-                            // Draw filled circle for node
+                            // Draw filled hexagon for node
                             let mut builder = PathBuilder::fill();
-                            let segments = 32;
-                            for i in 0..=segments {
-                                let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                            let sides = 6;
+                            let angle_offset = std::f32::consts::PI / 6.0;  // Start with flat top
+                            for i in 0..=sides {
+                                let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
                                 let x = center.x + radius * angle.cos();
                                 let y = center.y + radius * angle.sin();
                                 let p = point(x, y);
@@ -2124,15 +2289,16 @@ impl GraphView {
                                     builder.line_to(p);
                                 }
                             }
+                            builder.close();
                             
                             if let Ok(path) = builder.build() {
                                 window.paint_path(path, node_fill);
                             }
                             
-                            // Draw circle outline
-                            let mut builder = PathBuilder::stroke(px(3.0));
-                            for i in 0..=segments {
-                                let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                            // Draw hexagon outline
+                            let mut builder = PathBuilder::stroke(px(2.0));
+                            for i in 0..=sides {
+                                let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
                                 let x = center.x + radius * angle.cos();
                                 let y = center.y + radius * angle.sin();
                                 let p = point(x, y);
@@ -2143,6 +2309,7 @@ impl GraphView {
                                     builder.line_to(p);
                                 }
                             }
+                            builder.close();
                             
                             if let Ok(path) = builder.build() {
                                 window.paint_path(path, node_stroke);
@@ -2217,7 +2384,7 @@ impl GraphView {
                 
                 let centroid = dir_group.centroid;
                 
-                // Find max distance from centroid for positioning the label
+                // Find max distance from centroid for positioning the label (closer to lasso)
                 let max_dist = dir_group.node_indices.iter()
                     .filter_map(|&idx| nodes_for_labels.get(idx))
                     .map(|node| {
@@ -2227,25 +2394,26 @@ impl GraphView {
                     })
                     .fold(0.0f32, f32::max);
                 
-                let label_offset = max_dist + 80.0;
+                // Position label just outside the lasso (padding + small offset)
+                let label_offset = max_dist + 75.0;  // Closer to lasso edge
                 
                 Some(div()
                     .absolute()
-                    .top(px(centroid.y - label_offset - 10.0))
-                    .left(px(centroid.x - 50.0))
-                    .w(px(100.0))
+                    .top(px(centroid.y - label_offset))
+                    .left(px(centroid.x - 60.0))
+                    .w(px(120.0))
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .px_2()
-                            .py_1()
+                            .py_0p5()
                             .rounded_md()
-                            .bg(Hsla::from(rgb(0x3b82f6)).opacity(0.2))
+                            .bg(Hsla::from(rgb(0xbdb7fc)).opacity(0.3))  // Lavender background
                             .child(
                                 Label::new(folder_name)
                                     .size(LabelSize::Small)
-                                    .color(Color::Accent)
+                                    .color(Color::Default)
                             )
                     ))
             }))
