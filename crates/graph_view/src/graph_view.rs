@@ -73,12 +73,29 @@ pub struct GraphView {
     _subscriptions: Vec<Subscription>,
 }
 
-#[derive(Default)]
 struct GraphLayout {
     nodes: Vec<NodeLayout>,
     directories: HashMap<PathBuf, DirectoryGroup>,
     viewport_offset: Point<Pixels>,
     is_running: bool,
+    // Adaptive damping state
+    current_damping: f32,
+    high_energy_frames: u32,
+    base_damping: f32,
+}
+
+impl Default for GraphLayout {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            directories: HashMap::default(),
+            viewport_offset: Point::default(),
+            is_running: false,
+            current_damping: 0.85,
+            high_energy_frames: 0,
+            base_damping: 0.85,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -452,10 +469,12 @@ impl GraphView {
         all_dirs.sort_by_key(|p| p.components().count());
         
         // Assign positions to directories hierarchically
+        // Scale layout based on node count for big projects
+        let scale_factor = 1.0 + (node_count as f32).sqrt() * 0.15;
         let mut dir_positions: HashMap<PathBuf, Point<f32>> = HashMap::default();
-        let base_x = 500.0;
-        let base_y = 400.0;
-        let base_radius = 300.0;
+        let base_x = 400.0 * scale_factor;
+        let base_y = 400.0 * scale_factor;
+        let base_radius = 250.0 * scale_factor;
         
         // Position root-level directories in a circle
         let root_dirs: Vec<_> = all_dirs.iter()
@@ -466,10 +485,13 @@ impl GraphView {
             })
             .collect();
         
+        // Give more space between root directories based on how many there are
+        let dir_spacing_radius = base_radius + (root_dirs.len() as f32 * 50.0);
+        
         for (i, dir) in root_dirs.iter().enumerate() {
             let angle = (i as f32 / root_dirs.len().max(1) as f32) * std::f32::consts::TAU;
-            let x = base_x + base_radius * angle.cos();
-            let y = base_y + base_radius * angle.sin();
+            let x = base_x + dir_spacing_radius * angle.cos();
+            let y = base_y + dir_spacing_radius * angle.sin();
             dir_positions.insert((*dir).clone(), Point { x, y });
         }
         
@@ -485,9 +507,9 @@ impl GraphView {
                 .max_by_key(|p| p.components().count())
                 .and_then(|parent| dir_positions.get(parent))
             {
-                // Position child near parent with some offset
+                // Position child near parent with some offset (scaled)
                 let offset_angle = (dir.to_string_lossy().len() as f32 * 0.5) % std::f32::consts::TAU;
-                let offset_dist = 80.0;
+                let offset_dist = 100.0 * scale_factor;
                 dir_positions.insert(dir.clone(), Point {
                     x: parent_pos.x + offset_dist * offset_angle.cos(),
                     y: parent_pos.y + offset_dist * offset_angle.sin(),
@@ -503,10 +525,10 @@ impl GraphView {
             let directory = path.parent().unwrap_or(path.as_path()).to_path_buf();
             let dir_center = dir_positions.get(&directory).cloned().unwrap_or(Point { x: base_x, y: base_y });
             
-            // Get index within this directory for positioning
+            // Get index within this directory for positioning (scaled for big projects)
             let dir_node_count = dir_to_nodes.entry(directory.clone()).or_insert_with(Vec::new).len();
             let angle = (dir_node_count as f32 * 0.8) + (i as f32 * 0.3);
-            let node_radius = 60.0 + (dir_node_count as f32 * 15.0);
+            let node_radius = (60.0 + (dir_node_count as f32 * 20.0)) * scale_factor;
             
             let x = dir_center.x + node_radius * angle.cos();
             let y = dir_center.y + node_radius * angle.sin();
@@ -598,7 +620,9 @@ impl GraphView {
         let directory_attraction_strength = 0.03;
         let hierarchy_attraction_strength = 0.05;  // Attraction of child dirs to parent dirs
         let containment_strength = 0.1;  // Force to keep children inside parents
-        let damping = 0.85;
+        
+        // Use adaptive damping
+        let damping = self.layout.current_damping;
         
         // Update directory centroids and calculate radii
         let mut dir_radii: HashMap<PathBuf, f32> = HashMap::default();
@@ -722,9 +746,13 @@ impl GraphView {
         }
         
         // Update positions (but not for pinned nodes) with bounds constraints
+        // Scale bounds based on node count: more nodes = more space needed
         let min_bound = 50.0;
-        let max_bound_x = 2000.0;
-        let max_bound_y = 2000.0;
+        let base_size = 1500.0;
+        let size_per_node = 80.0;  // Each node adds ~80px of space
+        let max_bound = base_size + (node_count as f32).sqrt() * size_per_node * 10.0;
+        let max_bound_x = max_bound;
+        let max_bound_y = max_bound;
         
         for node in &mut self.layout.nodes {
             if !node.is_pinned {
@@ -743,6 +771,39 @@ impl GraphView {
                     node.velocity.y *= -0.5;
                 }
             }
+        }
+        
+        // Adaptive damping: calculate total kinetic energy
+        let kinetic_energy: f32 = self.layout.nodes.iter()
+            .filter(|n| !n.is_pinned)
+            .map(|n| n.velocity.x * n.velocity.x + n.velocity.y * n.velocity.y)
+            .sum();
+        
+        // Threshold for "high energy" scales with node count
+        let high_energy_threshold = 50.0 * node_count as f32;
+        let low_energy_threshold = 5.0 * node_count as f32;
+        let frames_before_increase = 30;  // ~0.5 seconds at 60fps
+        
+        if kinetic_energy > high_energy_threshold {
+            self.layout.high_energy_frames += 1;
+            
+            // If energy has been high for a while, increase damping
+            if self.layout.high_energy_frames > frames_before_increase {
+                // Ratchet up damping (lower value = more damping)
+                // Go from 0.85 -> 0.75 -> 0.65 -> 0.55 -> 0.45 (min)
+                self.layout.current_damping = (self.layout.current_damping - 0.05).max(0.45);
+                self.layout.high_energy_frames = 0;  // Reset counter for next ratchet
+            }
+        } else if kinetic_energy < low_energy_threshold {
+            // Energy is low, gradually return to base damping
+            self.layout.high_energy_frames = 0;
+            if self.layout.current_damping < self.layout.base_damping {
+                // Slowly restore damping (increase by small amount each frame)
+                self.layout.current_damping = (self.layout.current_damping + 0.002).min(self.layout.base_damping);
+            }
+        } else {
+            // Energy is moderate, don't change damping but reset high energy counter
+            self.layout.high_energy_frames = 0;
         }
     }
     
@@ -1938,7 +1999,12 @@ impl GraphView {
         let directories_for_labels = self.layout.directories.clone();
         let theme_colors = cx.theme().colors();
         
-        // Calculate canvas bounds
+        // Calculate canvas bounds - scale with node count for big projects
+        let node_count = self.layout.nodes.len();
+        let base_canvas_size = 1200.0;
+        let size_per_node = 80.0;
+        let min_canvas_size = base_canvas_size + (node_count as f32).sqrt() * size_per_node * 10.0;
+        
         let mut max_x = 0.0f32;
         let mut max_y = 0.0f32;
         let mut min_x = f32::MAX;
@@ -1949,8 +2015,8 @@ impl GraphView {
             min_x = min_x.min(node.position.x - 50.0);
             min_y = min_y.min(node.position.y - 50.0);
         }
-        let canvas_width = (max_x - min_x.min(0.0)).max(1200.0);
-        let canvas_height = (max_y - min_y.min(0.0)).max(800.0);
+        let canvas_width = (max_x - min_x.min(0.0)).max(min_canvas_size);
+        let canvas_height = (max_y - min_y.min(0.0)).max(min_canvas_size);
         
         let edge_color: Hsla = Hsla::from(rgb(0x5d3d3a));  // Cocoa color for edges
         let arrow_color: Hsla = Hsla::from(rgb(0x5d3d3a));  // Cocoa color for arrows
