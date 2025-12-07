@@ -620,6 +620,9 @@ impl GraphView {
         let directory_attraction_strength = 0.03;
         let hierarchy_attraction_strength = 0.05;  // Attraction of child dirs to parent dirs
         let containment_strength = 0.1;  // Force to keep children inside parents
+        let center_attraction_strength = 0.005;  // Weak attraction to prevent drift
+        let center_x = 500.0;
+        let center_y = 400.0;
         
         // Use adaptive damping
         let damping = self.layout.current_damping;
@@ -721,6 +724,10 @@ impl GraphView {
                     }
                 }
             }
+            
+            // Weak attraction to viewport center to prevent drift
+            force.x += (center_x - self.layout.nodes[i].position.x) * center_attraction_strength;
+            force.y += (center_y - self.layout.nodes[i].position.y) * center_attraction_strength;
             
             self.layout.nodes[i].velocity.x = (self.layout.nodes[i].velocity.x + force.x) * damping;
             self.layout.nodes[i].velocity.y = (self.layout.nodes[i].velocity.y + force.y) * damping;

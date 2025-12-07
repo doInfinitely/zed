@@ -184,3 +184,4 @@ Child directories are attracted toward parent directory centroids with containme
 - `Cargo.toml` - Added `graph_view` to workspace dependencies
 - `crates/zed/Cargo.toml` - Added `graph_view` dependency
 - `crates/zed/src/main.rs` - Initialize graph_view on startup
+
